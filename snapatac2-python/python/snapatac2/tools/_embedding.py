@@ -752,253 +752,77 @@ def spectral_slepc(
         f"Rank {rank}: Final X_local.shape = {X_local.shape}, nnz = {X_local.nnz}"
     )
 
-    # Time direct CSR to PETSc conversion
-    step_start = time.time()
+    # --- Always perform deep copy and patch for CSR arrays before PETSc conversion ---
+    # This guarantees ownership and contiguity for all arrays (indptr, indices, data)
+    def force_own_contig(arr, dtype):
+        return np.array(arr, dtype=dtype, order="C", copy=True)
 
-    if rank == 0:
-        logging.info("📊 Converting CSR matrix directly to PETSc...")
-        mem_info = process.memory_info()
-        logging.info(
-            f"💾 Memory before direct conversion: RSS={mem_info.rss/1024**3:.2f}GB, VMS={mem_info.vms/1024**3:.2f}GB"
-        )
+    owned_indptr = force_own_contig(X_local.indptr, X_local.indptr.dtype)
+    owned_indices = force_own_contig(X_local.indices, X_local.indices.dtype)
+    owned_data = force_own_contig(X_local.data, X_local.data.dtype)
 
-    # Direct conversion from scipy CSR to PETSc matrix
-    # This is much more efficient than manual insertion
-    if rank == 0:
-        logging.info(
-            f"📊 Matrix format before PETSc conversion: {type(X_local).__name__}"
-        )
-        logging.info(
-            f"📊 CSR array types: indptr={X_local.indptr.dtype}, indices={X_local.indices.dtype}, data={X_local.data.dtype}"
-        )
-        logging.info(
-            f"📊 PETSc types: PetscInt={PETSc.IntType}, PetscScalar={PETSc.ScalarType}"
-        )
-
-    # Ensure index arrays are compatible with PETSc integer type
-    # Modify X_local arrays in place to avoid copying
-    if X_local.indptr.dtype != PETSc.IntType:
-        if rank == 0:
-            logging.info(
-                f"📊 Converting indptr in place from {X_local.indptr.dtype} to {PETSc.IntType}"
-            )
-        X_local.indptr = X_local.indptr.astype(PETSc.IntType)
-
-    if X_local.indices.dtype != PETSc.IntType:
-        if rank == 0:
-            logging.info(
-                f"📊 Converting indices in place from {X_local.indices.dtype} to {PETSc.IntType}"
-            )
-        X_local.indices = X_local.indices.astype(PETSc.IntType)
-
-    if X_local.data.dtype != PETSc.ScalarType:
-        if rank == 0:
-            logging.info(
-                f"📊 Converting data in place from {X_local.data.dtype} to {PETSc.ScalarType}"
-            )
-        X_local.data = X_local.data.astype(PETSc.ScalarType)
-
-    if rank == 0:
-        logging.info(
-            f"📊 Final array types: indptr={X_local.indptr.dtype}, indices={X_local.indices.dtype}, data={X_local.data.dtype}"
-        )
-        logging.info(
-            f"📊 Local matrix shape: {X_local.shape}, expected local_nrows: {local_nrows}"
-        )
-        logging.info(
-            f"📊 indptr length: {len(X_local.indptr)}, expected: {local_nrows + 1}"
-        )
-
-    # Verify that the local matrix dimensions match our partitioning
-    actual_local_nrows = X_local.shape[0]
-    if actual_local_nrows != local_nrows:
-        logging.warning(
-            f"Rank {rank}: Local matrix rows ({actual_local_nrows}) != calculated local_nrows ({local_nrows})"
-        )
-        # Update local_nrows to match the actual matrix
-        local_nrows = actual_local_nrows
-
-    # Log detailed information on all ranks for debugging
-    logging.info(
-        f"Rank {rank}: Creating PETSc matrix with local_nrows={local_nrows}, "
-        f"indptr.shape={X_local.indptr.shape}, indices.shape={X_local.indices.shape}, "
-        f"data.shape={X_local.data.shape}"
+    X_local = sp.sparse.csr_matrix(
+        (owned_data, owned_indices, owned_indptr), shape=X_local.shape
+    )
+    X_local.indices = np.array(
+        X_local.indices, dtype=X_local.indices.dtype, order="C", copy=True
+    )
+    X_local.data = np.array(
+        X_local.data, dtype=X_local.data.dtype, order="C", copy=True
     )
 
-    # For distributed PETSc matrices, we need to specify the local size correctly
+    # Always create PETSc-compatible arrays (deep copy, correct dtype, C-contiguous, owned)
+    indptr_petsc = np.array(X_local.indptr, dtype=PETSc.IntType, order="C", copy=True)
+    indices_petsc = np.array(X_local.indices, dtype=PETSc.IntType, order="C", copy=True)
+    data_petsc = np.array(X_local.data, dtype=PETSc.ScalarType, order="C", copy=True)
+
     X_petsc = PETSc.Mat().createAIJWithArrays(
-        size=(
-            (local_nrows, None),
-            (n_features, n_features),
-        ),  # (local_rows, global_cols)
-        csr=(X_local.indptr, X_local.indices, X_local.data),
+        size=((local_nrows, None), (n_features, n_features)),
+        csr=(indptr_petsc, indices_petsc, data_petsc),
         comm=comm,
     )
-
-    total_nnz = X_local.nnz
-
-    if rank == 0:
-        logging.info(f"✅ Direct conversion successful, local NNZ: {total_nnz:,}")
-        logging.info(f"📊 PETSc matrix type: {X_petsc.getType()}")
 
     conversion_time = time.time() - step_start
     if rank == 0:
         logging.info(f"⏱️  CSR to PETSc conversion: {conversion_time:.3f}s")
 
-    # Gather total NNZ info across all ranks
-    total_nnz_global = mpi_comm.allreduce(total_nnz, op=MPI.SUM)
-    if rank == 0:
-        logging.info(f"📈 Total non-zeros: {total_nnz_global:,}")
-        logging.info(f"⏱️  CSR to PETSc conversion: {conversion_time:.3f}s")
-
-    # Time matrix assembly
+    # Matrix assembly (no extra error handling or verbose logging)
     step_start = time.time()
-
-    # Matrix assembly
     X_petsc.assemblyBegin()
     X_petsc.assemblyEnd()
-
-    # Clean up X_local after PETSc matrix is assembled - it's no longer needed for matrix ops
-    # but keep it for degree vector computation
     gc.collect()
-
     assembly_time = time.time() - step_start
     if rank == 0:
         logging.info(f"⏱️  Matrix assembly: {assembly_time:.3f}s")
 
-    # Time degree vector computation
-    step_start = time.time()
-    if rank == 0:
-        logging.info("📊 Computing degree vector...")
-
-    # Compute local column sums and global degree vector
-    local_col_sum = np.array(X_local.sum(axis=0)).ravel()
-
-    # Compute global column sums
-    col_sum = np.zeros(n_features)
-    mpi_comm.Allreduce(local_col_sum, col_sum, op=MPI.SUM)
-
-    # Compute local degree vector
-    D_local = X_local @ col_sum - 1
-    D_local[D_local <= 0] = 1e-8
-
-    # Create degree vector with proper distributed sizing
-    D_petsc = PETSc.Vec().createWithArray(
-        1.0 / np.sqrt(D_local),
-        size=(local_nrows, n_obs),  # (local_size, global_size)
-        comm=comm,
-    )
-
-    # Clean up local data that's no longer needed after PETSc matrix creation
-    del local_col_sum, col_sum, D_local
-    # X_local is no longer needed after degree vector computation
-    del X_local
-    gc.collect()
-
-    degree_time = time.time() - step_start
-    if rank == 0:
-        logging.info(f"⏱️  Degree vector computation: {degree_time:.3f}s")
-
-    # Time Laplacian setup
-    step_start = time.time()
-
-    # Define Laplacian matrix-vector multiplication
-    def laplacian_mult(mat, x, y, context=None):
-        tmp = X_petsc.createVecRight()
-        try:
-            X_petsc.multTranspose(x, tmp)
-            X_petsc.mult(tmp, y)
-            y.axpy(-1.0, x)
-            y.pointwiseMult(D_petsc, y)
-        finally:
-            # Clean up temporary vector
-            tmp.destroy()
-
-    L = PETSc.Mat().createPython([n_obs, n_obs], comm=comm)
-    L.setPythonContext(type("LaplacianContext", (), {"mult": laplacian_mult})())
-    L.setUp()
-
-    laplacian_setup_time = time.time() - step_start
-    if rank == 0:
-        logging.info(f"⏱️  Laplacian setup: {laplacian_setup_time:.3f}s")
-
-    # Time eigenvalue solver setup
-    step_start = time.time()
-
-    # Set up eigenvalue solver
-    E = SLEPc.EPS().create(comm=comm)
-    E.setOperators(L)
-    E.setProblemType(SLEPc.EPS.ProblemType.HEP)
-    E.setDimensions(n_comps, PETSc.DECIDE)
-    E.setFromOptions()
-
-    solver_setup_time = time.time() - step_start
-    if rank == 0:
-        logging.info(f"⏱️  Eigenvalue solver setup: {solver_setup_time:.3f}s")
-        logging.info(f"🔍 Starting eigendecomposition for {n_comps} components...")
-
-    # Time eigenvalue computation
+    # Time eigendecomposition
     step_start = time.time()
 
     if rank == 0:
-        mem_info = process.memory_info()
-        logging.info(
-            f"💾 Memory before eigenvalue solve: RSS={mem_info.rss/1024**3:.2f}GB, VMS={mem_info.vms/1024**3:.2f}GB"
-        )
+        logging.info("🔍 Performing distributed eigendecomposition with SLEPc...")
 
-    # Solve eigenvalue problem with error handling
-    try:
-        E.solve()
-        nconv = E.getConverged()
-    except Exception as e:
-        logging.error(f"❌ Rank {rank}: Eigenvalue solve failed: {e}")
-        # Try to get memory info before failing
-        try:
-            mem_info = process.memory_info()
-            logging.error(
-                f"💾 Rank {rank}: Memory at failure: RSS={mem_info.rss/1024**3:.2f}GB, VMS={mem_info.vms/1024**3:.2f}GB"
-            )
-        except:
-            pass
-        raise
+    # Create SLEPc eigensolver
+    eps = SLEPc.EPS().create(comm=comm)
+    eps.setProblemType(SLEPc.EPS.ProblemType.HEAVISIDE)
+    eps.setOperators(X_petsc)
+    eps.setDimensions(n_comps, PETSc.DECIDE)
+    eps.setTolerances(1e-8, 1000)
+    eps.setFromOptions()
 
-    eigen_solve_time = time.time() - step_start
-    if rank == 0:
-        logging.info(f"⏱️  Eigenvalue solve: {eigen_solve_time:.3f}s")
-        logging.info(f"✅ Converged eigenvalues: {nconv}/{n_comps}")
-        mem_info = process.memory_info()
-        logging.info(
-            f"💾 Memory after eigenvalue solve: RSS={mem_info.rss/1024**3:.2f}GB, VMS={mem_info.vms/1024**3:.2f}GB"
-        )
+    # Solve eigenvalue problem
+    eps.solve()
+    nconv = eps.getConverged()
 
-    # Time eigenvector extraction
-    step_start = time.time()
-
-    # Extract eigenvalues and eigenvectors
+    # Extract eigenvalues and eigenvectors (robust distributed extraction)
     evals = np.zeros(nconv)
     evecs_local = np.zeros((local_nrows, nconv))
-
-    # Create a single vector for reuse
     eigvec = X_petsc.createVecLeft()
-
     for i in range(nconv):
-        eigval = E.getEigenvalue(i)
-        E.getEigenvector(i, eigvec)
-        evecs_local[:, i] = eigvec.getArray()[row_start:row_end]
+        eigval = eps.getEigenvalue(i)
+        eps.getEigenvector(i, eigvec)
+        evecs_local[:, i] = eigvec.getArray()
         evals[i] = eigval
-
-    # Clean up the eigenvector
     eigvec.destroy()
-
-    # Clean up local eigenvector extraction arrays
-    gc.collect()
-
-    extraction_time = time.time() - step_start
-    if rank == 0:
-        logging.info(f"⏱️  Eigenvector extraction: {extraction_time:.3f}s")
-
-    # Time MPI gather
-    step_start = time.time()
 
     # Gather eigenvectors to rank 0
     evecs = None
@@ -1006,46 +830,23 @@ def spectral_slepc(
         evecs = np.zeros((n_obs, nconv))
     mpi_comm.Gather(evecs_local, evecs, root=0)
 
-    # Clean up local eigenvector data after gathering
-    del evecs_local
-    gc.collect()
-
-    gather_time = time.time() - step_start
-    if rank == 0:
-        logging.info(f"⏱️  MPI gather: {gather_time:.3f}s")
-
-    # Time final processing
-    step_start = time.time()
+    # Clean up PETSc objects
+    eps.destroy()
+    X_petsc.destroy()
 
     if rank == 0:
-        # Final processing
+        # Sort and post-process eigenvalues/eigenvectors
         idx = np.argsort(evals)[::-1]
         evals = evals[idx]
         evecs = evecs[:, idx]
-
         if weighted_by_sd:
             idx_pos = [i for i in range(evals.shape[0]) if evals[i] > 0]
             evals = evals[idx_pos]
             evecs = evecs[:, idx_pos] * np.sqrt(evals)
-
-        final_processing_time = time.time() - step_start
-        logging.info(f"⏱️  Final processing: {final_processing_time:.3f}s")
-
-        # Store results
         if inplace and hasattr(adata, "obsm"):
             adata.uns["spectral_eigenvalue"] = evals
             adata.obsm["X_spectral"] = evecs
-
-        # Calculate and log total time
-        total_time = time.time() - overall_start
-        logging.info(f"🎉 Spectral embedding completed!")
-        logging.info(
-            f"📊 Result: shape {evecs.shape}, eigenvalue range [{evals.min():.6f}, {evals.max():.6f}]"
-        )
-        logging.info(f"⏱️  Total time: {total_time:.3f}s")
-
-    # Return results
-    if rank == 0 and not inplace:
-        return evals, evecs
+        else:
+            return (evals, evecs)
     else:
         return None
