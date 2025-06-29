@@ -619,7 +619,7 @@ def spectral_slepc(
     # Handle features parameter (same logic as spectral function)
     if isinstance(features, str):
         if features in adata.var:
-            features = adata.var[features].to_numpy()
+            features = adata.var[features]
         else:
             raise NameError(
                 "Please call `select_features` first or explicitly set `features = None`"
@@ -762,9 +762,16 @@ def spectral_slepc(
     A_shell.setUp()
 
     # Test the shell matrix with a simple vector to make sure it works
-    test_vec = PETSc.Vec().createMPI(local_nrows, n_obs, comm=comm)
+    test_vec = PETSc.Vec().create(comm=comm)
+    test_vec.setSizes((local_nrows, n_obs))
+    test_vec.setFromOptions()
+    test_vec.setUp()
     test_vec.set(1.0)  # Fill with ones
-    test_result = PETSc.Vec().createMPI(local_nrows, n_obs, comm=comm)
+
+    test_result = PETSc.Vec().create(comm=comm)
+    test_result.setSizes((local_nrows, n_obs))
+    test_result.setFromOptions()
+    test_result.setUp()
     try:
         A_shell.mult(test_vec, test_result)
         test_norm = test_result.norm()
@@ -803,8 +810,11 @@ def spectral_slepc(
     # Extract eigenvalues and eigenvectors
     evals = np.zeros(nconv)
     evecs_local = np.zeros((local_nrows, nconv))
-    # Fix: use createMPI for eigenvector Vecs with correct parameter order
-    eigvec = PETSc.Vec().createMPI(local_nrows, n_obs, comm=comm)
+    # Create eigenvector Vec with proper sizing
+    eigvec = PETSc.Vec().create(comm=comm)
+    eigvec.setSizes((local_nrows, n_obs))
+    eigvec.setFromOptions()
+    eigvec.setUp()
     for i in range(nconv):
         eigval = eps.getEigenvalue(i)
         eps.getEigenvector(i, eigvec)
