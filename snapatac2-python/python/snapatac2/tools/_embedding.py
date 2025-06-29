@@ -577,116 +577,81 @@ def multi_spectral(
 def spectral_slepc(
     adata,
     n_comps: int = 30,
-    features=None,
-    feature_weights=None,
+    features: str | np.ndarray | None = "selected",
     random_state: int = 0,
+    sample_size: int | float | None = None,
+    sample_method: Literal["random", "degree"] = "random",
+    chunk_size: int = 20000,
+    distance_metric: Literal["jaccard", "cosine"] = "cosine",
     weighted_by_sd: bool = True,
+    feature_weights: list[float] | None = None,
     inplace: bool = True,
 ):
     """
-    Distributed spectral embedding using SLEPc (slepc4py) with in-memory processing.
+    Distributed spectral embedding using SLEPc (slepc4py) with a matrix-free Laplacian operator for the cosine similarity graph.
 
-    This function implements a distributed approach to spectral embedding using cosine distance
-    and distributed eigendecomposition with SLEPc. Each MPI rank processes its assigned rows
-    entirely in memory for optimal performance.
+    This function should produce mathematically identical results to the existing spectral() and spectral_embedding()
+    implementations when using the cosine metric without sampling.
 
-    Parameters
-    ----------
-    adata : AnnData
-        The annotated data matrix (backed or in-memory).
-    n_comps : int, default 30
-        Number of components to compute.
-    features : array-like or str, optional
-        Boolean mask or column names indicating which features to use.
-        If string, should refer to a column in adata.var.
-    feature_weights : array-like, optional
-        Weights for features used in cosine distance computation.
-    random_state : int, default 0
-        Random seed for reproducibility.
-    weighted_by_sd : bool, default True
-        Whether to weight eigenvectors by square root of eigenvalues.
-    inplace : bool, default True
-        Whether to store results in adata.obsm and adata.uns.
-
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray] or None
-        If inplace=False, returns (eigenvalues, eigenvectors).
-        If inplace=True, stores results in adata and returns None.
-
-    Notes
-    -----
-    - Requires MPI environment with petsc4py, slepc4py, and mpi4py installed
-    - Assumes sufficient memory to load assigned rows into memory
-    - Each MPI rank processes its full row range in memory
-    - Results are gathered to rank 0 for final processing
+    Note: Currently only supports cosine metric without sampling. Other parameters are kept for API compatibility.
     """
+    # Parameter validation for unsupported features
+    if distance_metric != "cosine":
+        raise NotImplementedError(
+            "spectral_slepc currently only supports cosine distance metric"
+        )
+    if sample_size is not None and sample_size < adata.n_obs:
+        raise NotImplementedError("spectral_slepc currently does not support sampling")
+
     import socket
     import time
     import psutil
     import os
+    import warnings
     from petsc4py import PETSc
     from slepc4py import SLEPc
     from mpi4py import MPI
 
-    # Start overall timing
     overall_start = time.time()
     step_start = overall_start
-
-    # Get process info for memory monitoring
     process = psutil.Process(os.getpid())
+
+    # Handle features parameter (same logic as spectral function)
+    if isinstance(features, str):
+        if features in adata.var:
+            features = adata.var[features].to_numpy()
+        else:
+            raise NameError(
+                "Please call `select_features` first or explicitly set `features = None`"
+            )
 
     n_obs, n_vars = adata.shape
     if features is not None:
-        if isinstance(features, str):
-            features = adata.var[features].to_numpy()
         n_features = np.sum(features)
     else:
         n_features = n_vars
 
+    # Limit n_comps as in spectral function
+    n_comps = min(adata.n_vars - 1, adata.n_obs - 1, n_comps)
+
     comm = PETSc.COMM_WORLD
     rank = comm.getRank()
     size = comm.getSize()
-
     node_name = socket.gethostname()
     mpi_comm = MPI.COMM_WORLD
 
-    if rank == 0:
-        logging.info(f"🚀 Starting spectral_slepc on {size} MPI processes")
-        logging.info(f"Dataset shape: {n_obs} x {n_vars} (features: {n_features})")
-        logging.info(f"Components requested: {n_comps}")
-        logging.info(f"Node: {node_name}")
-
-        # Log initial memory usage
-        mem_info = process.memory_info()
-        logging.info(
-            f"💾 Initial memory: RSS={mem_info.rss/1024**3:.2f}GB, VMS={mem_info.vms/1024**3:.2f}GB"
-        )
-
-    setup_time = time.time() - step_start
-    if rank == 0:
-        logging.info(f"⏱️  Initial setup: {setup_time:.3f}s")
-
-    # Time data partitioning
-    step_start = time.time()
-
-    rows_per_rank = math.ceil(n_obs / size)
-    row_start = rank * rows_per_rank
-    row_end = min((rank + 1) * rows_per_rank, n_obs)
+    # Partition rows (robust: sum(local_nrows) == n_obs)
+    rows_per_rank = n_obs // size
+    extra = n_obs % size
+    if rank < extra:
+        row_start = rank * (rows_per_rank + 1)
+        row_end = row_start + rows_per_rank + 1
+    else:
+        row_start = extra * (rows_per_rank + 1) + (rank - extra) * rows_per_rank
+        row_end = row_start + rows_per_rank
     local_nrows = row_end - row_start
 
-    partition_time = time.time() - step_start
-    if rank == 0:
-        logging.info(f"⏱️  Data partitioning: {partition_time:.3f}s")
-        logging.info(f"Rows per rank: {rows_per_rank} (local: {local_nrows})")
-
-    # Log partitioning across all ranks for debugging
-    logging.info(f"Rank {rank}: rows {row_start}:{row_end} (local_nrows={local_nrows})")
-
-    # Time data loading
-    step_start = time.time()
-
-    # Load all assigned rows into memory at once
+    # Load local data
     if features is not None:
         X_local = adata.X[row_start:row_end, features]
         if hasattr(X_local, "to_memory"):
@@ -695,132 +660,161 @@ def spectral_slepc(
         X_local = adata.X[row_start:row_end, :]
         if hasattr(X_local, "to_memory"):
             X_local = X_local.to_memory()
-
-    # Ensure X_local is in CSR format for efficient row iteration
-    if not sp.sparse.isspmatrix_csr(X_local):
-        if rank == 0:
-            logging.info(
-                f"📊 Converting {type(X_local).__name__} to CSR format during data loading..."
-            )
-        X_local = X_local.tocsr()
-
-    data_load_time = time.time() - step_start
-    if rank == 0:
-        logging.info(f"⏱️  Data loading: {data_load_time:.3f}s")
-        logging.info(f"📊 Matrix format after data loading: {type(X_local).__name__}")
-        mem_info = process.memory_info()
-        logging.info(
-            f"💾 Memory after data loading: RSS={mem_info.rss/1024**3:.2f}GB, VMS={mem_info.vms/1024**3:.2f}GB"
-        )
-
-    # Log matrix dimensions across all ranks
-    logging.info(f"Rank {rank}: X_local.shape = {X_local.shape}, nnz = {X_local.nnz}")
-
-    # Time feature weighting and normalization
-    step_start = time.time()
-
-    # Apply feature weights
     if feature_weights is not None:
         X_local = X_local @ sp.sparse.diags(feature_weights)
-
     # L2 normalize rows
     row_norms = np.sqrt(X_local.multiply(X_local).sum(axis=1)).A1
     row_norms[row_norms == 0] = 1
     X_local = X_local.multiply(1 / row_norms[:, None])
-
-    # Clean up temporary arrays
-    del row_norms
+    X_local = X_local.tocsr()
     gc.collect()
 
-    # Ensure X_local is in CSR format before PETSc conversion
-    if not sp.sparse.isspmatrix_csr(X_local):
-        if rank == 0:
-            logging.info(f"📊 Converting {type(X_local).__name__} to CSR format...")
-        X_local = X_local.tocsr()
+    # Compute distributed degree vector using Rust spectral_embedding logic:
+    # Step 1: Compute column sums across all ranks
+    ones_local = np.ones(local_nrows, dtype=np.float64)
+    X_local_T_ones = X_local.T @ ones_local  # Local contribution to column sums
 
-    normalization_time = time.time() - step_start
+    # Allreduce to get global column sums
+    col_sums_global = np.zeros_like(X_local_T_ones)
+    mpi_comm.Allreduce(X_local_T_ones, col_sums_global, op=MPI.SUM)
+
+    # Step 2: Compute degrees = X_local @ col_sums_global
+    degrees_local = X_local @ col_sums_global
+    degrees_local = np.array(degrees_local).ravel()
+
+    # Step 3: Compute degree_inv = 1 / (degrees - 1) (following Rust logic)
+    degree_inv_local = 1.0 / (degrees_local - 1.0)
+    degree_inv_local[~np.isfinite(degree_inv_local)] = 0.0
+
+    # Step 4: Apply degree-based row normalization (as in Rust)
+    # X_local[i,j] *= sqrt(degree_inv_local[i])
+    X_local = X_local.multiply(np.sqrt(degree_inv_local)[:, np.newaxis])
+
+    # Step 5: Compute D_norm for the Laplacian operator
+    # D_norm = 1 / degree_inv = (degrees - 1)
+    D_local = 1.0 / degree_inv_local
+    D_local[~np.isfinite(D_local)] = 0.0
+
+    # PETSc shell matrix for Laplacian operator (matching Rust implementation)
+    class LaplacianContext:
+        def __init__(self, X_local, D_local, row_start, row_end, mpi_comm):
+            self.X_local = X_local
+            self.D_local = D_local
+            self.row_start = row_start
+            self.row_end = row_end
+            self.mpi_comm = mpi_comm
+
+        def mult(self, mat, x, y):
+            try:
+                # Get read-only access to input vector
+                x_local = x.getArray(readonly=True)
+                assert (
+                    x_local.shape[0] == self.X_local.shape[0]
+                ), f"[Rank {rank}] x_local shape {x_local.shape} != local_nrows {self.X_local.shape[0]}"
+
+                # Rust-style matrix-free operator: L*v = X*(v.T*X).T - D*v
+                # Step 1: Compute v.T @ X_local (this is a row vector of size n_features)
+                vT_X_local = x_local @ self.X_local  # Shape: (n_features,)
+
+                # Step 2: Allreduce to get global v.T @ X
+                vT_X_global = np.zeros_like(vT_X_local)
+                self.mpi_comm.Allreduce(vT_X_local, vT_X_global, op=MPI.SUM)
+
+                # Step 3: Compute local output: y = X @ (v.T @ X).T - D * v
+                # Note: (v.T @ X).T = X.T @ v, but we compute X @ (v.T @ X) directly
+                y_local = self.X_local @ vT_X_global - self.D_local * x_local
+                assert (
+                    y_local.shape[0] == self.X_local.shape[0]
+                ), f"[Rank {rank}] y_local shape {y_local.shape} != local_nrows {self.X_local.shape[0]}"
+
+                # Set local output - ensure contiguous array
+                y_local = np.ascontiguousarray(y_local, dtype=np.float64)
+                y.setArray(y_local)
+
+            except Exception as e:
+                print(f"[Rank {rank}] Exception in mult(): {e}")
+                import traceback
+
+                traceback.print_exc()
+                raise
+
+    # Create PETSc shell matrix
+    local_nrows_all = mpi_comm.allgather(local_nrows)
+    # Verify distributed matrix partitioning
     if rank == 0:
-        logging.info(f"⏱️  Normalization: {normalization_time:.3f}s")
-        logging.info(f"📊 Matrix format after normalization: {type(X_local).__name__}")
-        mem_info = process.memory_info()
-        logging.info(
-            f"💾 Memory after normalization: RSS={mem_info.rss/1024**3:.2f}GB, VMS={mem_info.vms/1024**3:.2f}GB"
+        print(
+            f"[Rank 0] Creating distributed shell matrix: n_obs={n_obs}, n_features={n_features}, MPI_size={size}"
         )
+        print(
+            f"[Rank 0] Row partitioning verified: sum={sum(local_nrows_all)} == n_obs={n_obs}"
+        )
+    assert (
+        sum(local_nrows_all) == n_obs
+    ), f"Sum of local_nrows ({sum(local_nrows_all)}) != n_obs ({n_obs})"
 
-    # Log final matrix dimensions before PETSc conversion
-    logging.info(
-        f"Rank {rank}: Final X_local.shape = {X_local.shape}, nnz = {X_local.nnz}"
-    )
+    context = LaplacianContext(X_local, D_local, row_start, row_end, mpi_comm)
+    A_shell = PETSc.Mat().create(comm=comm)
+    # Set local and global sizes: local rows, global rows; local cols, global cols
+    # For shell matrices, both row and column distributions should be the same
+    A_shell.setSizes([[local_nrows, n_obs], [local_nrows, n_obs]])
+    A_shell.setType("python")
+    A_shell.setPythonContext(context)
+    A_shell.setUp()
 
-    # --- Always perform deep copy and patch for CSR arrays before PETSc conversion ---
-    # This guarantees ownership and contiguity for all arrays (indptr, indices, data)
-    def force_own_contig(arr, dtype):
-        return np.array(arr, dtype=dtype, order="C", copy=True)
+    # Test the shell matrix with a simple vector to make sure it works
+    test_vec = PETSc.Vec().createMPI(local_nrows, n_obs, comm=comm)
+    test_vec.set(1.0)  # Fill with ones
+    test_result = PETSc.Vec().createMPI(local_nrows, n_obs, comm=comm)
+    try:
+        A_shell.mult(test_vec, test_result)
+        test_norm = test_result.norm()
+        if rank == 0:
+            print(
+                f"[Rank 0] Shell matrix validated successfully (test norm: {test_norm:.2e})"
+            )
+    except Exception as e:
+        print(f"[Rank {rank}] Shell matrix validation failed: {e}")
+        raise
+    finally:
+        test_vec.destroy()
+        test_result.destroy()
 
-    owned_indptr = force_own_contig(X_local.indptr, X_local.indptr.dtype)
-    owned_indices = force_own_contig(X_local.indices, X_local.indices.dtype)
-    owned_data = force_own_contig(X_local.data, X_local.data.dtype)
-
-    X_local = sp.sparse.csr_matrix(
-        (owned_data, owned_indices, owned_indptr), shape=X_local.shape
-    )
-    X_local.indices = np.array(
-        X_local.indices, dtype=X_local.indices.dtype, order="C", copy=True
-    )
-    X_local.data = np.array(
-        X_local.data, dtype=X_local.data.dtype, order="C", copy=True
-    )
-
-    # Always create PETSc-compatible arrays (deep copy, correct dtype, C-contiguous, owned)
-    indptr_petsc = np.array(X_local.indptr, dtype=PETSc.IntType, order="C", copy=True)
-    indices_petsc = np.array(X_local.indices, dtype=PETSc.IntType, order="C", copy=True)
-    data_petsc = np.array(X_local.data, dtype=PETSc.ScalarType, order="C", copy=True)
-
-    X_petsc = PETSc.Mat().createAIJWithArrays(
-        size=((local_nrows, None), (n_features, n_features)),
-        csr=(indptr_petsc, indices_petsc, data_petsc),
-        comm=comm,
-    )
-
-    conversion_time = time.time() - step_start
-    if rank == 0:
-        logging.info(f"⏱️  CSR to PETSc conversion: {conversion_time:.3f}s")
-
-    # Matrix assembly (no extra error handling or verbose logging)
-    step_start = time.time()
-    X_petsc.assemblyBegin()
-    X_petsc.assemblyEnd()
-    gc.collect()
-    assembly_time = time.time() - step_start
-    if rank == 0:
-        logging.info(f"⏱️  Matrix assembly: {assembly_time:.3f}s")
-
-    # Time eigendecomposition
-    step_start = time.time()
-
-    if rank == 0:
-        logging.info("🔍 Performing distributed eigendecomposition with SLEPc...")
-
-    # Create SLEPc eigensolver
+    # SLEPc eigensolver
     eps = SLEPc.EPS().create(comm=comm)
-    eps.setProblemType(SLEPc.EPS.ProblemType.HEAVISIDE)
-    eps.setOperators(X_petsc)
+    eps.setProblemType(SLEPc.EPS.ProblemType.HEP)
+    eps.setOperators(A_shell)
     eps.setDimensions(n_comps, PETSc.DECIDE)
     eps.setTolerances(1e-8, 1000)
     eps.setFromOptions()
 
-    # Solve eigenvalue problem
-    eps.solve()
+    if rank == 0:
+        print(f"[Rank 0] Starting distributed eigensolver for {n_comps} components...")
+
+    try:
+        eps.solve()
+    except Exception as e:
+        print(f"[Rank {rank}] Exception in eps.solve(): {e}")
+        raise
     nconv = eps.getConverged()
 
-    # Extract eigenvalues and eigenvectors (robust distributed extraction)
+    if rank == 0:
+        print(f"[Rank 0] Eigensolver converged {nconv} eigenvalues")
+
+    # Extract eigenvalues and eigenvectors
     evals = np.zeros(nconv)
     evecs_local = np.zeros((local_nrows, nconv))
-    eigvec = X_petsc.createVecLeft()
+    # Fix: use createMPI for eigenvector Vecs with correct parameter order
+    eigvec = PETSc.Vec().createMPI(local_nrows, n_obs, comm=comm)
     for i in range(nconv):
         eigval = eps.getEigenvalue(i)
         eps.getEigenvector(i, eigvec)
-        evecs_local[:, i] = eigvec.getArray()
+        arr = eigvec.getArray()
+        # Diagnostic: check shape
+        if arr.shape[0] != local_nrows:
+            print(
+                f"[Rank {rank}] eigvec.getArray() shape mismatch: {arr.shape} vs {local_nrows}"
+            )
+        evecs_local[:, i] = arr
         evals[i] = eigval
     eigvec.destroy()
 
@@ -830,12 +824,10 @@ def spectral_slepc(
         evecs = np.zeros((n_obs, nconv))
     mpi_comm.Gather(evecs_local, evecs, root=0)
 
-    # Clean up PETSc objects
     eps.destroy()
-    X_petsc.destroy()
+    A_shell.destroy()
 
     if rank == 0:
-        # Sort and post-process eigenvalues/eigenvectors
         idx = np.argsort(evals)[::-1]
         evals = evals[idx]
         evecs = evecs[:, idx]
@@ -843,6 +835,11 @@ def spectral_slepc(
             idx_pos = [i for i in range(evals.shape[0]) if evals[i] > 0]
             evals = evals[idx_pos]
             evecs = evecs[:, idx_pos] * np.sqrt(evals)
+        # Add informative warning if not enough eigenvectors are returned
+        if evecs.shape[1] < n_comps:
+            warnings.warn(
+                f"Requested {n_comps} eigenvectors, but only {evecs.shape[1]} were returned. This may be due to lack of convergence or insufficient positive eigenvalues."
+            )
         if inplace and hasattr(adata, "obsm"):
             adata.uns["spectral_eigenvalue"] = evals
             adata.obsm["X_spectral"] = evecs
