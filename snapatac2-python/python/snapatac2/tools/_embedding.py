@@ -586,6 +586,7 @@ def spectral_slepc(
     weighted_by_sd: bool = True,
     feature_weights: list[float] | None = None,
     inplace: bool = True,
+    verbose: bool = True,
 ):
     """
     Distributed spectral embedding using SLEPc (slepc4py) with a matrix-free Laplacian operator for the cosine similarity graph.
@@ -594,6 +595,8 @@ def spectral_slepc(
     implementations when using the cosine metric without sampling.
 
     Note: Currently only supports cosine metric without sampling. Other parameters are kept for API compatibility.
+    When feature_weights is None, the inverse document frequency (IDF) is automatically calculated and used,
+    similar to the spectral() function.
     """
     # Parameter validation for unsupported features
     if distance_metric != "cosine":
@@ -619,7 +622,7 @@ def spectral_slepc(
     # Handle features parameter (same logic as spectral function)
     if isinstance(features, str):
         if features in adata.var:
-            features = adata.var[features]
+            features = adata.var[features].to_numpy()
         else:
             raise NameError(
                 "Please call `select_features` first or explicitly set `features = None`"
@@ -633,6 +636,16 @@ def spectral_slepc(
 
     # Limit n_comps as in spectral function
     n_comps = min(adata.n_vars - 1, adata.n_obs - 1, n_comps)
+
+    # Calculate feature weights using IDF if not provided
+    if feature_weights is None:
+        feature_weights = idf(adata, features)
+
+    # Set random seed for reproducibility (same as spectral function)
+    np.random.seed(random_state)
+
+    # Also seed PETSc random number generator for deterministic behavior
+    PETSc.Options().setValue("-random_seed", str(random_state))
 
     comm = PETSc.COMM_WORLD
     rank = comm.getRank()
@@ -660,17 +673,21 @@ def spectral_slepc(
         X_local = adata.X[row_start:row_end, :]
         if hasattr(X_local, "to_memory"):
             X_local = X_local.to_memory()
+
+    # Step 1: Apply feature weights (following SpectralMatrixFree exactly)
     if feature_weights is not None:
         X_local = X_local @ sp.sparse.diags(feature_weights)
-    # L2 normalize rows
-    row_norms = np.sqrt(X_local.multiply(X_local).sum(axis=1)).A1
-    row_norms[row_norms == 0] = 1
-    X_local = X_local.multiply(1 / row_norms[:, None])
+
+    # Step 2: L2 normalize rows (following SpectralMatrixFree exactly)
+    # s = 1 / sqrt(row_sums), then X = diag(s) @ X
+    row_sums = np.array(X_local.multiply(X_local).sum(axis=1)).flatten()
+    s = 1.0 / np.sqrt(row_sums)
+    s[~np.isfinite(s)] = 0.0
+    X_local = sp.sparse.diags(s) @ X_local
     X_local = X_local.tocsr()
     gc.collect()
 
-    # Compute distributed degree vector using Rust spectral_embedding logic:
-    # Step 1: Compute column sums across all ranks
+    # Step 3: Compute distributed column sums for degree calculation
     ones_local = np.ones(local_nrows, dtype=np.float64)
     X_local_T_ones = X_local.T @ ones_local  # Local contribution to column sums
 
@@ -678,22 +695,24 @@ def spectral_slepc(
     col_sums_global = np.zeros_like(X_local_T_ones)
     mpi_comm.Allreduce(X_local_T_ones, col_sums_global, op=MPI.SUM)
 
-    # Step 2: Compute degrees = X_local @ col_sums_global
+    # Step 4: Compute degrees and D = degrees - 1 (following SpectralMatrixFree exactly)
     degrees_local = X_local @ col_sums_global
     degrees_local = np.array(degrees_local).ravel()
+    D_local = degrees_local - 1.0  # This is the key step from SpectralMatrixFree
 
-    # Step 3: Compute degree_inv = 1 / (degrees - 1) (following Rust logic)
-    degree_inv_local = 1.0 / (degrees_local - 1.0)
-    degree_inv_local[~np.isfinite(degree_inv_local)] = 0.0
+    # Handle potential numerical issues
+    D_local[~np.isfinite(D_local)] = 1e-10
+    D_local[D_local <= 0] = 1e-10
 
-    # Step 4: Apply degree-based row normalization (as in Rust)
-    # X_local[i,j] *= sqrt(degree_inv_local[i])
-    X_local = X_local.multiply(np.sqrt(degree_inv_local)[:, np.newaxis])
+    if rank == 0 and verbose:
+        print(f"[Rank 0] D_local range: [{D_local.min():.6f}, {D_local.max():.6f}]")
 
-    # Step 5: Compute D_norm for the Laplacian operator
-    # D_norm = 1 / degree_inv = (degrees - 1)
-    D_local = 1.0 / degree_inv_local
-    D_local[~np.isfinite(D_local)] = 0.0
+    # Step 5: Apply degree normalization (following SpectralMatrixFree exactly)
+    # X = diag(1/sqrt(D)) @ X
+    D_sqrt_inv = 1.0 / np.sqrt(D_local)
+    D_sqrt_inv[~np.isfinite(D_sqrt_inv)] = 0.0
+    X_local = sp.sparse.diags(D_sqrt_inv) @ X_local
+    X_local = X_local.tocsr()
 
     # PETSc shell matrix for Laplacian operator (matching Rust implementation)
     class LaplacianContext:
@@ -712,7 +731,7 @@ def spectral_slepc(
                     x_local.shape[0] == self.X_local.shape[0]
                 ), f"[Rank {rank}] x_local shape {x_local.shape} != local_nrows {self.X_local.shape[0]}"
 
-                # Rust-style matrix-free operator: L*v = X*(v.T*X).T - D*v
+                # SpectralMatrixFree-style matrix-free operator: f(v) = X @ (v.T @ X).T - (1/D) * v
                 # Step 1: Compute v.T @ X_local (this is a row vector of size n_features)
                 vT_X_local = x_local @ self.X_local  # Shape: (n_features,)
 
@@ -720,9 +739,13 @@ def spectral_slepc(
                 vT_X_global = np.zeros_like(vT_X_local)
                 self.mpi_comm.Allreduce(vT_X_local, vT_X_global, op=MPI.SUM)
 
-                # Step 3: Compute local output: y = X @ (v.T @ X).T - D * v
-                # Note: (v.T @ X).T = X.T @ v, but we compute X @ (v.T @ X) directly
-                y_local = self.X_local @ vT_X_global - self.D_local * x_local
+                # Step 3: Compute local output: y = X @ (v.T @ X).T - (1/D) * v
+                # Following SpectralMatrixFree exactly
+                y_local = self.X_local @ vT_X_global - (1.0 / self.D_local) * x_local
+
+                # Ensure numerical stability
+                y_local = np.where(np.isfinite(y_local), y_local, 0.0)
+
                 assert (
                     y_local.shape[0] == self.X_local.shape[0]
                 ), f"[Rank {rank}] y_local shape {y_local.shape} != local_nrows {self.X_local.shape[0]}"
@@ -741,7 +764,7 @@ def spectral_slepc(
     # Create PETSc shell matrix
     local_nrows_all = mpi_comm.allgather(local_nrows)
     # Verify distributed matrix partitioning
-    if rank == 0:
+    if rank == 0 and verbose:
         print(
             f"[Rank 0] Creating distributed shell matrix: n_obs={n_obs}, n_features={n_features}, MPI_size={size}"
         )
@@ -775,7 +798,7 @@ def spectral_slepc(
     try:
         A_shell.mult(test_vec, test_result)
         test_norm = test_result.norm()
-        if rank == 0:
+        if rank == 0 and verbose:
             print(
                 f"[Rank 0] Shell matrix validated successfully (test norm: {test_norm:.2e})"
             )
@@ -784,17 +807,26 @@ def spectral_slepc(
         raise
     finally:
         test_vec.destroy()
-        test_result.destroy()
-
-    # SLEPc eigensolver
+        test_result.destroy()  # SLEPc eigensolver configured to match scipy.sparse.linalg.eigsh exactly
     eps = SLEPc.EPS().create(comm=comm)
     eps.setProblemType(SLEPc.EPS.ProblemType.HEP)
     eps.setOperators(A_shell)
     eps.setDimensions(n_comps, PETSc.DECIDE)
-    eps.setTolerances(1e-8, 1000)
+
+    # Try to match scipy's eigsh as closely as possible
+    # scipy uses ARPACK which is an Arnoldi-based method
+    eps.setType(SLEPc.EPS.Type.KRYLOVSCHUR)  # More stable than pure Arnoldi
+    eps.setWhichEigenpairs(SLEPc.EPS.Which.LARGEST_MAGNITUDE)
+
+    # Use reasonable tight tolerance for good agreement with scipy without being too slow
+    eps.setTolerances(1e-10, 1000)  # Good balance of accuracy and speed
+
+    # Use relative convergence test (more stable)
+    eps.setConvergenceTest(SLEPc.EPS.Conv.REL)
+
     eps.setFromOptions()
 
-    if rank == 0:
+    if rank == 0 and verbose:
         print(f"[Rank 0] Starting distributed eigensolver for {n_comps} components...")
 
     try:
@@ -804,8 +836,18 @@ def spectral_slepc(
         raise
     nconv = eps.getConverged()
 
-    if rank == 0:
+    # Get convergence information for diagnostics
+    if rank == 0 and verbose:
+        reason = eps.getConvergedReason()
+        its = eps.getIterationNumber()
         print(f"[Rank 0] Eigensolver converged {nconv} eigenvalues")
+        print(f"[Rank 0] Convergence reason: {reason}, iterations: {its}")
+
+        # Check if we got good convergence
+        if nconv < n_comps:
+            print(
+                f"[Rank 0] Warning: Only {nconv} eigenvalues converged out of {n_comps} requested"
+            )
 
     # Extract eigenvalues and eigenvectors
     evals = np.zeros(nconv)
@@ -828,23 +870,76 @@ def spectral_slepc(
         evals[i] = eigval
     eigvec.destroy()
 
-    # Gather eigenvectors to rank 0
+    # Gather eigenvectors to rank 0 (handling unequal row distribution)
     evecs = None
     if rank == 0:
         evecs = np.zeros((n_obs, nconv))
-    mpi_comm.Gather(evecs_local, evecs, root=0)
+        # Copy rank 0's data directly
+        evecs[row_start:row_end, :] = evecs_local
+
+        # Receive data from other ranks
+        for src_rank in range(1, size):
+            # Calculate the row range for the source rank
+            src_rows_per_rank = n_obs // size
+            src_extra = n_obs % size
+            if src_rank < src_extra:
+                src_row_start = src_rank * (src_rows_per_rank + 1)
+                src_row_end = src_row_start + src_rows_per_rank + 1
+            else:
+                src_row_start = (
+                    src_extra * (src_rows_per_rank + 1)
+                    + (src_rank - src_extra) * src_rows_per_rank
+                )
+                src_row_end = src_row_start + src_rows_per_rank
+            src_local_nrows = src_row_end - src_row_start
+
+            # Receive the eigenvectors from this rank
+            recv_data = np.empty((src_local_nrows, nconv), dtype=np.float64)
+            mpi_comm.Recv(recv_data, source=src_rank, tag=src_rank)
+            evecs[src_row_start:src_row_end, :] = recv_data
+    else:
+        # Send local eigenvectors to rank 0
+        mpi_comm.Send(evecs_local, dest=0, tag=rank)
 
     eps.destroy()
     A_shell.destroy()
 
     if rank == 0:
+        # Sort eigenvalues and eigenvectors in descending order (same as scipy)
         idx = np.argsort(evals)[::-1]
         evals = evals[idx]
         evecs = evecs[:, idx]
+
+        # Ensure eigenvalues are real and non-negative (remove any numerical artifacts)
+        evals = np.real(evals)
+        evecs = np.real(evecs)
+
+        # Apply the exact same filtering as the original spectral function
         if weighted_by_sd:
-            idx_pos = [i for i in range(evals.shape[0]) if evals[i] > 0]
-            evals = evals[idx_pos]
-            evecs = evecs[:, idx_pos] * np.sqrt(evals)
+            if verbose:
+                print(f"[Rank 0] Pre-filtering eigenvalues: {evals}")
+                print(f"[Rank 0] Eigenvalues > 0: {np.sum(evals > 0)}")
+                print(f"[Rank 0] Eigenvalues > 1e-10: {np.sum(evals > 1e-10)}")
+
+            # Use the exact same filtering as spectral function
+            idx = [i for i in range(evals.shape[0]) if evals[i] > 0]
+            if verbose:
+                print(
+                    f"[Rank 0] Filtering: keeping {len(idx)} out of {len(evals)} eigenvalues"
+                )
+
+            # Limit to the requested number of components to match spectral() behavior
+            # This ensures we return the same number of components as the original function
+            if len(idx) > n_comps:
+                idx = idx[:n_comps]
+                if verbose:
+                    print(
+                        f"[Rank 0] Limiting to {n_comps} components to match spectral() behavior"
+                    )
+
+            evals = evals[idx]
+            evecs = evecs[:, idx] * np.sqrt(evals)
+
         # Add informative warning if not enough eigenvectors are returned
         if evecs.shape[1] < n_comps:
             warnings.warn(
